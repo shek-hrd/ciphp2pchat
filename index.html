@@ -156,7 +156,7 @@ async function boot() {
   log(`BW     : ${bw} kB/s`);
 
   // 5c. websocket to relay
-  ws = new WebSocket(`wss://${location.host}`);
+  ws = new WebSocket(`wss://chat-relay-zim2.onrender.com`);
   ws.onopen = () => ws.send(JSON.stringify({type:'join', id:me.stamp, pub:me.pub}));
   ws.onmessage = onMsg;
   ws.onclose   = () => log('❌ Disconnected');
