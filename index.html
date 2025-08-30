@@ -1,23 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>Lightweight P2P-Encrypted Chat</title>
+  <style>
+    body { font-family: sans-serif; margin: 0; padding: 1rem; background:#f5f5f5}
+    #log { background:#fff; border:1px solid #ccc; height:60vh; overflow-y:auto; padding:.5rem; white-space:pre-wrap; font-family:monospace }
+    input { width:80%; padding:.5rem }
+    button { padding:.5rem 1rem }
+  </style>
+</head>
+<body>
+
+<h1>Lightweight Encrypted Chat</h1>
+<div id="log">🔌 Connecting…</div>
+<input id="msg" placeholder="type & press Enter" autocomplete="off"/>
+<button onclick="send()">Send</button>
+
 <script>
 /* =========================================================================
-   CONFIG: change to your Render service URL once
-   ========================================================================= */
-const RELAY_HOST = 'chat-relay-zim2.onrender.com';   // <-- FIX
-const RELAY_WS   = `wss://${RELAY_HOST}`;
-const RELAY_PING = `https://${RELAY_HOST}/ping`;
-const RELAY_BLOB = `https://${RELAY_HOST}/dummy256k.bin`;
-
-/* =========================================================================
-   0.  Helpers
+   0.  Tiny helpers
    ========================================================================= */
 const $ = id => document.getElementById(id);
 const log = txt => { logEl.textContent += txt + '\n'; logEl.scrollTop = 1e9; };
 const logEl = $('log');
 
 /* =========================================================================
-   1.  IndexedDB wrappers
+   1.  Persistent key storage wrappers
    ========================================================================= */
-const DB_NAME = 'chatcache', STORE_NAME = 'keys';
+const DB_NAME = 'chatcache';
+const STORE_NAME = 'keys';
 async function openDB() {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, 1);
@@ -26,32 +38,43 @@ async function openDB() {
     req.onsuccess = () => resolve(req.result);
   });
 }
-async function dbPut(k, v) { const db=await openDB(); return new Promise((r,x)=>{const t=db.transaction(STORE_NAME,'readwrite');t.objectStore(STORE_NAME).put(v,k).onerror=x; t.oncomplete=r;});}
-async function dbGet(k)   { const db=await openDB(); return new Promise((r,x)=>{const t=db.transaction(STORE_NAME,'readonly');const q=t.objectStore(STORE_NAME).get(k); q.onerror=x; q.onsuccess=()=>r(q.result);});}
+async function dbPut(key, val) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    const req = tx.objectStore(STORE_NAME).put(val, key);
+    req.onerror = () => reject(req.error);
+    req.onsuccess = () => resolve();
+  });
+}
+async function dbGet(key) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(STORE_NAME, 'readonly').objectStore(STORE_NAME).get(key);
+    req.onerror = () => reject(req.error);
+    req.onsuccess = () => resolve(req.result);
+  });
+}
 
 /* =========================================================================
-   2.  Fingerprint — skips Audio until user gesture
+   2.  Fingerprint generator (canvas + audio + UA)
    ========================================================================= */
-let audioCtx;
-function initAudioCtx() {
-  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-  if (audioCtx.state === 'suspended') audioCtx.resume();
-}
 async function fingerprint() {
   const canvas = document.createElement('canvas');
   const ctx = canvas.getContext('2d');
-  ctx.textBaseline = 'top'; ctx.font = '14px Arial'; ctx.fillText('fp', 2, 2);
+  ctx.textBaseline = 'top';
+  ctx.font = '14px Arial';
+  ctx.fillText('fingerprint', 2, 2);
   const canvasHash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canvas.toDataURL()));
 
-  // Audio only after user gesture
-  initAudioCtx();
+  const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
   const osc = audioCtx.createOscillator();
-  const dest = audioCtx.createMediaStreamDestination();
-  osc.connect(dest); osc.start();
+  const dst = audioCtx.createMediaStreamDestination();
+  osc.connect(dst);
+  osc.start();
   const buf = new Float32Array(44100);
+  const p = dst.stream.getAudioTracks()[0].getSettings().sampleRate;
   const audioHash = await crypto.subtle.digest('SHA-256', buf.buffer);
-  osc.stop();
-
   const str = [
     new Uint8Array(canvasHash).reduce((a,b)=>a+b.toString(16).padStart(2,'0'),''),
     new Uint8Array(audioHash).reduce((a,b)=>a+b.toString(16).padStart(2,'0'),''),
@@ -65,93 +88,105 @@ async function fingerprint() {
 }
 
 /* =========================================================================
-   3.  Crypto
+   3.  Crypto helpers (ECDH + AES-GCM)
    ========================================================================= */
 async function genKeyPair() {
   return crypto.subtle.generateKey({name:'ECDH', namedCurve:'P-256'}, false, ['deriveKey']);
 }
 async function deriveShared(priv, pub) {
-  return crypto.subtle.deriveKey({name:'ECDH', public:pub}, priv, {name:'AES-GCM', length:256}, false, ['encrypt','decrypt']);
+  return crypto.subtle.deriveKey(
+    {name:'ECDH', public: pub},
+    priv,
+    {name:'AES-GCM', length:256},
+    false,
+    ['encrypt','decrypt']
+  );
 }
-async function encrypt(key, text) {
+async function encrypt(key, plaintext) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ct = new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM', iv}, key, new TextEncoder().encode(text)));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM', iv}, key, new TextEncoder().encode(plaintext)));
   return btoa(String.fromCharCode(...iv, ...ct));
 }
 async function decrypt(key, blob) {
   const bytes = new Uint8Array(atob(blob).split('').map(c=>c.charCodeAt(0)));
-  const iv = bytes.slice(0,12), ct = bytes.slice(12);
-  return new TextDecoder().decode(await crypto.subtle.decrypt({name:'AES-GCM', iv}, key, ct));
+  const iv = bytes.slice(0,12);
+  const ct = bytes.slice(12);
+  const dec = new TextDecoder().decode(await crypto.subtle.decrypt({name:'AES-GCM', iv}, key, ct));
+  return dec;
 }
 
 /* =========================================================================
-   4.  Network metrics — against Render host
+   4.  Network metrics (RTT & bandwidth)
    ========================================================================= */
 async function measureMetrics() {
-  let rtt = 0, bw = 0;
-  try {
-    const t0 = performance.now();
-    await fetch(RELAY_PING);
-    rtt = Math.round(performance.now() - t0);
-  } catch { /* ignore */ }
-  try {
-    const t1 = performance.now();
-    const resp = await fetch(RELAY_BLOB);
-    if (resp.ok) await resp.arrayBuffer();
-    bw = Math.round(256 / ((performance.now() - t1)/1000)); // kB/s
-  } catch { /* ignore */ }
+  // RTT: measure time to GET /ping endpoint
+  const t0 = performance.now();
+  await fetch('./ping');
+  const rtt = Math.round(performance.now() - t0);
+
+  // Bandwidth: download 256 kB dummy file
+  const t1 = performance.now();
+  const resp = await fetch('./dummy256k.bin');
+  await resp.arrayBuffer();
+  const bw = Math.round(256 / ((performance.now() - t1)/1000)); // kB/s
   return {rtt, bw};
 }
 
 /* =========================================================================
-   5.  Boot
+   5.  Boot sequence
    ========================================================================= */
 let me, peers = new Map(), ws;
-
-// Defer everything until first click (satisfies Audio policy)
-document.addEventListener('click', async () => {
-  if (ws) return; // run once
+async function boot() {
+  // 5a. load or create identity
   const stamp = await fingerprint();
   const cached = await dbGet('identity');
   if (cached && cached.stamp === stamp) {
     me = cached;
   } else {
-    const kp = await genKeyPair();
-    const pubJwk = await crypto.subtle.exportKey('jwk', kp.publicKey);
-    me = {stamp, pub:pubJwk, priv:kp.privateKey};
+    const keyPair = await genKeyPair();
+    const pubJwk = await crypto.subtle.exportKey('jwk', keyPair.publicKey);
+    me = {stamp, pub: pubJwk, priv: keyPair.privateKey};
     await dbPut('identity', me);
   }
 
+  // 5b. metrics
   const {rtt, bw} = await measureMetrics();
-  log(`Stamp : ${me.stamp}`);
-  log(`RTT   : ${rtt} ms`);
-  log(`BW    : ${bw} kB/s`);
+  log(`Stamp  : ${me.stamp}`);
+  log(`RTT    : ${rtt} ms`);
+  log(`BW     : ${bw} kB/s`);
 
-  ws = new WebSocket(RELAY_WS);
+  // 5c. websocket to relay
+  ws = new WebSocket(`wss://chat-relay-zim2.onrender.com`);
   ws.onopen = () => ws.send(JSON.stringify({type:'join', id:me.stamp, pub:me.pub}));
-  ws.onmessage = async evt => {
-    const {type, from, payload} = JSON.parse(evt.data);
-    if (type === 'peerlist') {
-      peers.clear();
-      payload.forEach(p => peers.set(p.id, p.pub));
-      log(`👥 ${peers.size} peers online`);
-    }
-    if (type === 'msg') {
-      const pub = await crypto.subtle.importKey('jwk', peers.get(from), {name:'ECDH', namedCurve:'P-256'}, false, []);
-      const shared = await deriveShared(me.priv, pub);
-      const text = await decrypt(shared, payload);
-      log(`💬 ${from.slice(0,8)}… : ${text}`);
-    }
-  };
-  ws.onclose = () => log('❌ Disconnected');
-}, {once:true});
+  ws.onmessage = onMsg;
+  ws.onclose   = () => log('❌ Disconnected');
+}
+boot();
 
 /* =========================================================================
-   6.  Send
+   6.  Messaging
    ========================================================================= */
+async function onMsg(evt) {
+  const {type, from, payload} = JSON.parse(evt.data);
+  if (type === 'peerlist') {
+    peers.clear();
+    payload.forEach(p => peers.set(p.id, p.pub));
+    log(`👥 ${peers.size} peers online`);
+    return;
+  }
+  if (type === 'msg') {
+    const pub = await crypto.subtle.importKey('jwk', peers.get(from), {name:'ECDH', namedCurve:'P-256'}, false, []);
+    const shared = await deriveShared(me.priv, pub);
+    const text = await decrypt(shared, payload);
+    log(`💬 ${from.slice(0,8)}… : ${text}`);
+  }
+}
+
 async function send() {
-  const text = $('msg').value.trim(); if (!text) return;
+  const text = $('msg').value.trim();
+  if (!text) return;
   $('msg').value = '';
+  // broadcast to each peer
   for (const [id, pubJwk] of peers) {
     const pub = await crypto.subtle.importKey('jwk', pubJwk, {name:'ECDH', namedCurve:'P-256'}, false, []);
     const shared = await deriveShared(me.priv, pub);
@@ -160,5 +195,9 @@ async function send() {
   }
   log(`✉️ You: ${text}`);
 }
-$('msg').addEventListener('keydown', e => e.key==='Enter' && send());
+
+// Enter to send
+$('msg').addEventListener('keydown', e => e.key === 'Enter' && send());
 </script>
+</body>
+</html>
