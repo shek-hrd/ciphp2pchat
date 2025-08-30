@@ -160,5 +160,8 @@ async function send() {
   }
   log(`✉️ You: ${text}`);
 }
-$('msg').addEventListener('keydown', e => e.key==='Enter' && send());
+// Wait until DOM is ready, then attach listener
+window.addEventListener('DOMContentLoaded', () => {
+  $('msg').addEventListener('keydown', e => e.key === 'Enter' && send());
+});
 </script>
